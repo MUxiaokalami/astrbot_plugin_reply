@@ -1,307 +1,465 @@
-from astrbot.api.all import *
-from astrbot.api.event.filter import command, permission_type, event_message_type, EventMessageType, PermissionType
-from astrbot.api.star import StarTools
-from astrbot.api import logger
 import json
 import os
 import re
-from pathlib import Path
-from typing import Dict, List, Union
 
+from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.star import StarTools, Context, Star, register
+from astrbot.api import logger
+import astrbot.api.message_components as Comp
 
 @register(
-    name="智能回复",
-    desc="支持文字、图片、正则匹配的自定义关键词回复插件",
-    version="v2.0",
+    name="reply",
+    desc="自定义关键词回复插件，支持文字、图片混合回复，群组独立配置，关键词管理，@用户回复，配置热切换。",
+    version="v2.5",
     author="小卡拉米",
     repo="https://github.com/MUxiaokalami/astrbot_plugin_reply"
 )
 class KeywordReplyPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
+        self.context = context
         plugin_data_dir = StarTools.get_data_dir("astrbot_plugin_reply")
         self.config_path = os.path.join(plugin_data_dir, "keyword_reply_config.json")
-        self.image_dir = os.path.join(plugin_data_dir, "images")
-        os.makedirs(self.image_dir, exist_ok=True)
-        self.keyword_map = self._load_config()
-        logger.info(f"配置文件路径：{self.config_path}")
+        self.config = self._load_config()
+        
+        # 默认配置
+        self.default_settings = {
+            "admin_qq": "",
+            "default_enabled": True,
+            "group_separate": True,
+            "max_keywords_per_group": 50,
+            "enable_image_reply": True,
+            "allow_network_images": True,
+            "reply_with_at": True
+        }
+        
+        # 立即加载管理后台配置
+        self._reload_settings()
+        logger.info(f"reply插件初始化完成，配置: {self.get_settings()}")
+
+    def _reload_settings(self):
+        """重新加载管理后台配置"""
+        try:
+            if hasattr(self.context, "settings") and self.context.settings:
+                # 深度合并配置
+                current_settings = self.default_settings.copy()
+                current_settings.update(self.context.settings)
+                self.context.settings = current_settings
+                logger.info(f"配置已重新加载: {self.context.settings}")
+        except Exception as e:
+            logger.error(f"重新加载配置异常: {e}")
+
+    def get_settings(self):
+        """获取当前有效配置"""
+        try:
+            if hasattr(self.context, "settings") and self.context.settings:
+                return self.context.settings
+        except:
+            pass
+        return self.default_settings
 
     def _load_config(self) -> dict:
-        """加载本地配置文件"""
+        default_config = {"global": {}, "groups": {}}
         try:
             if not os.path.exists(self.config_path):
-                return {}
+                os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
+                with open(self.config_path, "w", encoding="utf-8") as f:
+                    json.dump(default_config, f, ensure_ascii=False, indent=2)
+                return default_config
             with open(self.config_path, "r", encoding="utf-8") as f:
-                config = json.load(f)
-                # 兼容旧版本配置
-                return self._migrate_old_config(config)
+                content = f.read().strip()
+                if not content:
+                    with open(self.config_path, "w", encoding="utf-8") as fw:
+                        json.dump(default_config, fw, ensure_ascii=False, indent=2)
+                    return default_config
+                config = json.loads(content)
+                if "global" not in config:
+                    config["global"] = {}
+                if "groups" not in config:
+                    config["groups"] = {}
+                return config
         except Exception as e:
-            logger.error(f"配置加载失败: {str(e)}")
-            return {}
+            logger.error(f"配置加载失败: {e}")
+            return default_config
 
-    def _migrate_old_config(self, config: dict) -> dict:
-        """迁移旧版本配置到新格式"""
-        new_config = {}
-        for keyword, reply in config.items():
-            if isinstance(reply, str):
-                # 旧版本只有文字回复
-                new_config[keyword] = {
-                    "type": "text",
-                    "content": reply,
-                    "exact_match": True
-                }
-            else:
-                new_config[keyword] = reply
-        return new_config
-
-    def _save_config(self, data: dict):
-        """保存配置到文件"""
+    def _save_config(self):
         try:
+            os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
             with open(self.config_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+                json.dump(self.config, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            logger.error(f"配置保存失败: {str(e)}")
+            logger.error(f"配置保存失败: {e}")
 
-    def _save_image(self, image_data: bytes, filename: str) -> str:
-        """保存图片到本地"""
-        filepath = os.path.join(self.image_dir, filename)
-        with open(filepath, "wb") as f:
-            f.write(image_data)
-        return filepath
+    def _get_group_id(self, event) -> str:
+        try:
+            group_id = event.get_group_id()
+            if group_id:
+                return str(group_id)
+            if event.is_private_chat():
+                return None
+            session_id = event.get_session_id()
+            if session_id and 'group' in session_id:
+                parts = session_id.split('_')
+                for part in parts:
+                    if part.isdigit() and len(part) > 6:
+                        return part
+            return None
+        except Exception as e:
+            logger.error(f"获取群组ID失败: {e}")
+            return None
 
-    @command("添加回复")
-    @permission_type(PermissionType.ADMIN)
+    def _get_group_config(self, group_id: str) -> dict:
+        if "groups" not in self.config:
+            self.config["groups"] = {}
+        if group_id not in self.config["groups"]:
+            self.config["groups"][group_id] = {}
+        return self.config["groups"].get(group_id, {})
+
+    def _get_global_config(self) -> dict:
+        if "global" not in self.config:
+            self.config["global"] = {}
+        return self.config["global"]
+
+    def _is_admin(self, event) -> bool:
+        try:
+            if event.is_admin():
+                return True
+            settings = self.get_settings()
+            admin_qq_str = settings.get("admin_qq", "")
+            if admin_qq_str:
+                admins = [x.strip() for x in admin_qq_str.split(",") if x.strip()]
+                sender = str(event.get_sender_id())
+                return sender in admins
+            return False
+        except:
+            return False
+
+    def _is_image_path(self, text: str) -> bool:
+        settings = self.get_settings()
+        enable_img = settings.get('enable_image_reply', True)
+        allow_net = settings.get('allow_network_images', True)
+        if not enable_img:
+            return False
+        text = text.strip()
+        patterns = [r'^.*\.(jpg|jpeg|png|gif|bmp|webp)$']
+        if allow_net:
+            patterns.append(r'^https?://.*\.(jpg|jpeg|png|gif|bmp|webp)')
+        return any(re.match(p, text, re.IGNORECASE) for p in patterns)
+
+    def _parse_reply_to_message_chain(self, content: str):
+        """解析回复内容为消息链，保留原始换行格式"""
+        content = content.strip()
+        if not content:
+            return []
+        
+        # 如果是纯图片路径，直接返回图片
+        if self._is_image_path(content):
+            img_path = content.strip()
+            if img_path.lower().startswith(('http://', 'https://')):
+                return [Comp.Image.fromURL(img_path)]
+            else:
+                return [Comp.Image.fromFileSystem(img_path)]
+        
+        chain = []
+        lines = content.splitlines()
+        img_pattern = r'^\s*\[(图片|img)\](\S+)\s*$'
+        mixed_pattern = r'^(.*)\[(图片|img)\](\S+)\s*$'
+        
+        for line in lines:
+            line = line.rstrip()  # 保留行首空格，只去掉行尾空格
+            
+            # 检查是否为纯图片行
+            match_img = re.match(img_pattern, line, re.IGNORECASE)
+            if match_img:
+                img_path = match_img.group(2).strip()
+                if img_path:
+                    if img_path.lower().startswith(('http://', 'https://')):
+                        chain.append(Comp.Image.fromURL(img_path))
+                    else:
+                        chain.append(Comp.Image.fromFileSystem(img_path))
+                continue
+                
+            # 检查是否为图文混合行
+            match_mixed = re.match(mixed_pattern, line, re.IGNORECASE)
+            if match_mixed:
+                text_part = match_mixed.group(1).strip()
+                img_path = match_mixed.group(3).strip()
+                
+                if text_part:
+                    chain.append(Comp.Plain(text_part))
+                if img_path:
+                    if img_path.lower().startswith(('http://', 'https://')):
+                        chain.append(Comp.Image.fromURL(img_path))
+                    else:
+                        chain.append(Comp.Image.fromFileSystem(img_path))
+                continue
+                
+            # 纯文本行 - 保留原始换行，添加换行符
+            if line.strip():
+                chain.append(Comp.Plain(line + "\n"))
+        
+        # 如果最后一个是文本且有换行符，去掉最后一个换行符
+        if chain and isinstance(chain[-1], Comp.Plain) and chain[-1].text.endswith("\n"):
+            chain[-1] = Comp.Plain(chain[-1].text.rstrip("\n"))
+        
+        return chain
+
+    def _check_keyword_limit(self, group_id: str) -> bool:
+        settings = self.get_settings()
+        max_keywords = settings.get('max_keywords_per_group', 50)
+        if not group_id:
+            return True
+        group_cfg = self._get_group_config(group_id)
+        global_cfg = self._get_global_config()
+        current_count = len(group_cfg) + len(global_cfg)
+        return current_count < max_keywords
+
+    @filter.command("添加回复")
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def add_reply(self, event: AstrMessageEvent):
-        """
-        添加自定义回复
-        格式1(文字): /添加回复 关键字|文字|回复内容
-        格式2(图片): /添加回复 关键字|图片|图片URL或base64
-        格式3(混合): /添加回复 关键字|混合|文字内容|图片URL
-        """
+        settings = self.get_settings()
+        group_id = self._get_group_id(event)
+        if not group_id and settings.get("group_separate", True):
+            yield event.plain_result("❌ 此功能仅限群聊使用")
+            return
+        if not self._is_admin(event):
+            yield event.plain_result("❌ 权限不足，需要管理员权限")
+            return
+        if not self._check_keyword_limit(group_id):
+            max_count = settings.get('max_keywords_per_group', 50)
+            yield event.plain_result(f"❌ 关键词数量已达上限（{max_count}个）")
+            return
         full_message = event.get_message_str()
-        
-        # 解析命令
-        args = self._parse_command(full_message, ["添加回复", "/添加回复"])
-        if not args:
-            yield event.plain_result("❌ 格式错误，请使用：/添加回复 关键字|类型|内容")
+        args = full_message.replace("/添加回复", "").replace("添加回复", "").strip()
+        parts = args.split("|", 1)
+        if len(parts) != 2:
+            yield event.plain_result(
+                "❌ 格式错误，正确格式：/添加回复 关键字|回复内容\n支持多行、图文混合、多个[图片]链接"
+            )
             return
-
-        parts = args.split("|", 2)
-        if len(parts) < 3:
-            yield event.plain_result("❌ 格式错误，正确格式：/添加回复 关键字|类型|内容")
-            return
-        
         keyword = parts[0].strip()
-        reply_type = parts[1].strip().lower()
-        content = parts[2]
-
+        reply_content = parts[1].strip()
         if not keyword:
             yield event.plain_result("❌ 关键字不能为空")
             return
-
-        reply_config = {
-            "type": reply_type,
-            "content": content,
-            "exact_match": True,  # 默认精确匹配
-            "enabled": True
+        chain_preview = self._parse_reply_to_message_chain(reply_content)
+        for ele in chain_preview:
+            if isinstance(ele, Comp.Image):
+                img_path = getattr(ele, "url", None) or getattr(ele, "path", None) or ""
+                img_path = img_path.strip(" \t.\n\r")
+                if img_path and not self._is_image_path(img_path):
+                    yield event.plain_result(f"❌ 图片路径格式不正确或未启用：{img_path}")
+                    return
+        reply_data = {
+            "raw": reply_content,
+            "enabled": settings.get("default_enabled", True)
         }
+        if group_id and settings.get("group_separate", True):
+            group_cfg = self._get_group_config(group_id)
+            group_cfg[keyword] = reply_data
+        else:
+            global_cfg = self._get_global_config()
+            global_cfg[keyword] = reply_data
+        self._save_config()
+        yield event.plain_result(f"✅ 已添加关键词回复：{keyword}\n内容预览：\n{reply_content[:200]}")
 
-        # 处理图片类型
-        if reply_type == "图片":
-            try:
-                # 这里需要根据实际情况处理图片数据
-                # 可能是URL或base64编码的图片数据
-                image_filename = f"{keyword}_{len(self.keyword_map)}.png"
-                # 实际实现中需要解析并保存图片
-                reply_config["image_path"] = image_filename
-            except Exception as e:
-                yield event.plain_result(f"❌ 图片处理失败: {str(e)}")
-                return
-
-        self.keyword_map[keyword] = reply_config
-        self._save_config(self.keyword_map)
-        yield event.plain_result(f"✅ 已添加关键词回复：{keyword} -> [{reply_type}]")
-
-    @command("添加正则回复")
-    @permission_type(PermissionType.ADMIN)
-    async def add_regex_reply(self, event: AstrMessageEvent):
-        """添加正则表达式匹配的回复"""
-        full_message = event.get_message_str()
-        
-        args = self._parse_command(full_message, ["添加正则回复", "/添加正则回复"])
-        if not args:
-            yield event.plain_result("❌ 格式错误，请使用：/添加正则回复 正则表达式|回复内容")
-            return
-
-        parts = args.split("|", 1)
-        if len(parts) != 2:
-            yield event.plain_result("❌ 格式错误，正确格式：/添加正则回复 正则表达式|回复内容")
-            return
-        
-        regex_pattern = parts[0].strip()
-        reply_content = parts[1]
-
-        # 验证正则表达式
-        try:
-            re.compile(regex_pattern)
-        except re.error as e:
-            yield event.plain_result(f"❌ 正则表达式错误: {str(e)}")
-            return
-
-        reply_config = {
-            "type": "regex",
-            "pattern": regex_pattern,
-            "content": reply_content,
-            "enabled": True
-        }
-
-        regex_key = f"regex_{len([k for k in self.keyword_map.keys() if k.startswith('regex_')])}"
-        self.keyword_map[regex_key] = reply_config
-        self._save_config(self.keyword_map)
-        yield event.plain_result(f"✅ 已添加正则回复：{regex_pattern}")
-
-    @command("查看回复")
+    @filter.command("查看回复")
     async def list_replies(self, event: AstrMessageEvent):
-        """查看所有关键词回复"""
-        if not self.keyword_map:
+        settings = self.get_settings()
+        group_id = self._get_group_id(event)
+        if not group_id and settings.get("group_separate", True):
+            yield event.plain_result("❌ 此功能仅限群聊使用")
+            return
+        global_cfg = self._get_global_config()
+        group_cfg = self._get_group_config(group_id) if group_id else {}
+        if not global_cfg and not group_cfg:
             yield event.plain_result("暂无自定义回复")
             return
-        
-        msg = "当前关键词回复列表：\n"
-        for i, (key, config) in enumerate(self.keyword_map.items()):
-            if config.get("type") == "regex":
-                status = "✅" if config.get("enabled", True) else "❌"
-                msg += f"{i+1}. [正则] {config['pattern']} {status}\n"
-            else:
-                status = "✅" if config.get("enabled", True) else "❌"
-                match_type = "精确" if config.get("exact_match", True) else "模糊"
-                msg += f"{i+1}. [{match_type}] {key} -> {config['content'][:20]}... {status}\n"
-        
+
+        msg = "关键词回复列表：\n"
+        def preview_text(v):
+            txt = v.get("raw", "")
+            pre = txt.split("\n", 1)[0][:20] + ("..." if len(txt) > 20 else "")
+            img_nums = txt.count("[图片]") + txt.count("[img]")
+            return f"{pre}{' 📷x'+str(img_nums) if img_nums else ''}"
+
+        if global_cfg:
+            msg += "\n【全局回复】\n"
+            for i, (k,v) in enumerate(global_cfg.items(),1):
+                status = "✅" if v.get("enabled", True) else "❌"
+                msg += f"{i}. {status} {k} -> {preview_text(v)}\n"
+
+        if group_cfg and group_id:
+            msg += f"\n【群 {group_id} 回复】\n"
+            for i, (k,v) in enumerate(group_cfg.items(),1):
+                status = "✅" if v.get("enabled", True) else "❌"
+                msg += f"{i}. {status} {k} -> {preview_text(v)}\n"
+
         yield event.plain_result(msg)
 
-    @command("删除回复")
-    @permission_type(PermissionType.ADMIN)
-    async def delete_reply(self, event: AstrMessageEvent, index: str):
-        """根据序号删除回复"""
-        try:
-            idx = int(index) - 1
-            keys = list(self.keyword_map.keys())
-            if 0 <= idx < len(keys):
-                key = keys[idx]
-                del self.keyword_map[key]
-                self._save_config(self.keyword_map)
-                yield event.plain_result(f"✅ 已删除第{index}个回复")
-            else:
-                yield event.plain_result("❌ 序号无效")
-        except ValueError:
-            yield event.plain_result("❌ 请输入有效的序号")
-
-    @command("启用回复")
-    @permission_type(PermissionType.ADMIN)
-    async def enable_reply(self, event: AstrMessageEvent, index: str):
-        """启用回复规则"""
-        await self._toggle_reply(event, index, True)
-
-    @command("禁用回复")
-    @permission_type(PermissionType.ADMIN)
-    async def disable_reply(self, event: AstrMessageEvent, index: str):
-        """禁用回复规则"""
-        await self._toggle_reply(event, index, False)
-
-    async def _toggle_reply(self, event: AstrMessageEvent, index: str, enabled: bool):
-        """切换回复规则状态"""
-        try:
-            idx = int(index) - 1
-            keys = list(self.keyword_map.keys())
-            if 0 <= idx < len(keys):
-                key = keys[idx]
-                self.keyword_map[key]["enabled"] = enabled
-                self._save_config(self.keyword_map)
-                status = "启用" if enabled else "禁用"
-                yield event.plain_result(f"✅ 已{status}第{index}个回复")
-            else:
-                yield event.plain_result("❌ 序号无效")
-        except ValueError:
-            yield event.plain_result("❌ 请输入有效的序号")
-
-    @command("切换匹配模式")
-    @permission_type(PermissionType.ADMIN)
-    async def toggle_match_mode(self, event: AstrMessageEvent, index: str):
-        """切换精确/模糊匹配模式"""
-        try:
-            idx = int(index) - 1
-            keys = list(self.keyword_map.keys())
-            if 0 <= idx < len(keys):
-                key = keys[idx]
-                if self.keyword_map[key].get("type") == "regex":
-                    yield event.plain_result("❌ 正则表达式不支持切换匹配模式")
-                    return
-                
-                current_mode = self.keyword_map[key].get("exact_match", True)
-                self.keyword_map[key]["exact_match"] = not current_mode
-                self._save_config(self.keyword_map)
-                new_mode = "精确" if not current_mode else "模糊"
-                yield event.plain_result(f"✅ 已切换第{index}个回复为{new_mode}匹配")
-            else:
-                yield event.plain_result("❌ 序号无效")
-        except ValueError:
-            yield event.plain_result("❌ 请输入有效的序号")
-
-    def _parse_command(self, message: str, prefixes: list) -> str:
-        """解析命令前缀"""
-        for prefix in prefixes:
-            if message.startswith(prefix):
-                return message[len(prefix):].strip()
-        return ""
-
-    @event_message_type(EventMessageType.ALL)
-    async def handle_message(self, event: AstrMessageEvent):
-        if not event.is_at_or_wake_command:
+    @filter.command("删除回复")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def delete_reply(self, event: AstrMessageEvent):
+        settings = self.get_settings()
+        group_id = self._get_group_id(event)
+        if not group_id and settings.get("group_separate", True):
+            yield event.plain_result("❌ 此功能仅限群聊使用")
             return
-        
-        msg = event.message_str.strip()
-        msg_lower = msg.lower()
+        if not self._is_admin(event):
+            yield event.plain_result("❌ 权限不足，需要管理员权限")
+            return
+        full_msg = event.get_message_str()
+        keyword = full_msg.replace("/删除回复", "").replace("删除回复", "").strip()
+        if not keyword:
+            yield event.plain_result("❌ 请提供要删除的关键字")
+            return
+        deleted = False
+        if group_id:
+            group_cfg = self._get_group_config(group_id)
+            if keyword in group_cfg:
+                del group_cfg[keyword]
+                deleted = True
+        if not deleted:
+            global_cfg = self._get_global_config()
+            if keyword in global_cfg:
+                del global_cfg[keyword]
+                deleted = True
+        if not deleted:
+            yield event.plain_result(f"❌ 未找到关键词：{keyword}")
+            return
+        self._save_config()
+        yield event.plain_result(f"✅ 已删除关键词：{keyword}")
 
-        # 检查精确匹配
-        for keyword, config in self.keyword_map.items():
-            if not config.get("enabled", True):
-                continue
+    @filter.command("重载配置")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def reload_config(self, event: AstrMessageEvent):
+        """手动重载管理后台配置"""
+        if not self._is_admin(event):
+            yield event.plain_result("❌ 权限不足，需要管理员权限")
+            return
+            
+        try:
+            self._reload_settings()
+            yield event.plain_result("✅ 配置重载成功")
+        except Exception as e:
+            logger.error(f"配置重载失败: {e}")
+            yield event.plain_result(f"❌ 配置重载失败: {e}")
+
+    @filter.command("启用回复")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def enable_reply(self, event: AstrMessageEvent):
+        """启用指定关键词回复"""
+        settings = self.get_settings()
+        group_id = self._get_group_id(event)
+        if not group_id and settings.get("group_separate", True):
+            yield event.plain_result("❌ 此功能仅限群聊使用")
+            return
+        if not self._is_admin(event):
+            yield event.plain_result("❌ 权限不足，需要管理员权限")
+            return
+            
+        full_msg = event.get_message_str()
+        keyword = full_msg.replace("/启用回复", "").replace("启用回复", "").strip()
+        if not keyword:
+            yield event.plain_result("❌ 请提供要启用的关键字")
+            return
+            
+        updated = False
+        if group_id:
+            group_cfg = self._get_group_config(group_id)
+            if keyword in group_cfg:
+                group_cfg[keyword]["enabled"] = True
+                updated = True
                 
-            if config.get("type") == "regex":
-                # 正则匹配
-                try:
-                    if re.search(config["pattern"], msg):
-                        yield event.plain_result(config["content"])
-                        return
-                except re.error:
-                    continue
-            else:
-                # 关键词匹配
-                if config.get("exact_match", True):
-                    # 精确匹配
-                    if msg_lower == keyword.lower():
-                        await self._send_reply(event, config)
-                        return
-                else:
-                    # 模糊匹配
-                    if keyword.lower() in msg_lower:
-                        await self._send_reply(event, config)
-                        return
+        if not updated:
+            global_cfg = self._get_global_config()
+            if keyword in global_cfg:
+                global_cfg[keyword]["enabled"] = True
+                updated = True
+                
+        if not updated:
+            yield event.plain_result(f"❌ 未找到关键词：{keyword}")
+            return
+            
+        self._save_config()
+        yield event.plain_result(f"✅ 已启用关键词：{keyword}")
 
-    async def _send_reply(self, event: AstrMessageEvent, config: dict):
-        """发送回复内容"""
-        reply_type = config.get("type", "text")
-        content = config.get("content", "")
+    @filter.command("禁用回复")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def disable_reply(self, event: AstrMessageEvent):
+        """禁用指定关键词回复"""
+        settings = self.get_settings()
+        group_id = self._get_group_id(event)
+        if not group_id and settings.get("group_separate", True):
+            yield event.plain_result("❌ 此功能仅限群聊使用")
+            return
+        if not self._is_admin(event):
+            yield event.plain_result("❌ 权限不足，需要管理员权限")
+            return
+            
+        full_msg = event.get_message_str()
+        keyword = full_msg.replace("/禁用回复", "").replace("禁用回复", "").strip()
+        if not keyword:
+            yield event.plain_result("❌ 请提供要禁用的关键字")
+            return
+            
+        updated = False
+        if group_id:
+            group_cfg = self._get_group_config(group_id)
+            if keyword in group_cfg:
+                group_cfg[keyword]["enabled"] = False
+                updated = True
+                
+        if not updated:
+            global_cfg = self._get_global_config()
+            if keyword in global_cfg:
+                global_cfg[keyword]["enabled"] = False
+                updated = True
+                
+        if not updated:
+            yield event.plain_result(f"❌ 未找到关键词：{keyword}")
+            return
+            
+        self._save_config()
+        yield event.plain_result(f"✅ 已禁用关键词：{keyword}")
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def handle_message(self, event: AstrMessageEvent):
+        settings = self.get_settings()
+        reply_with_at = settings.get("reply_with_at", True)
+        msg = event.message_str.strip()
         
-        if reply_type == "图片":
-            # 发送图片回复
-            # 这里需要根据实际图片路径或URL发送图片
-            # yield event.image_result(config.get("image_path", ""))
-            yield event.plain_result(f"[图片] {content}")
-        elif reply_type == "混合":
-            # 发送文字和图片混合回复
-            yield event.plain_result(content)
-            # yield event.image_result(config.get("image_path", ""))
-        else:
-            # 文字回复
-            yield event.plain_result(content)
+        if not msg:
+            return
+            
+        group_id = self._get_group_id(event)
+        reply_data = None
+        
+        # 查找匹配的回复
+        if group_id:
+            group_cfg = self._get_group_config(group_id)
+            if msg in group_cfg:
+                reply_data = group_cfg[msg]
+                
+        if not reply_data:
+            global_cfg = self._get_global_config()
+            if msg in global_cfg:
+                reply_data = global_cfg[msg]
+                
+        if not reply_data or not reply_data.get("enabled", True):
+            return
+            
+        raw_content = reply_data.get("raw", "")
+        chain = []
+        
+        # 群聊中@用户
+        if reply_with_at and group_id:
+            chain.append(Comp.At(qq=event.get_sender_id()))
+            chain.append(Comp.Plain("\n"))  # 确保@后换行
+        
+        # 解析回复内容
+        reply_chain = self._parse_reply_to_message_chain(raw_content)
+        chain.extend(reply_chain)
+        
+        if chain:
+            yield event.chain_result(chain)
