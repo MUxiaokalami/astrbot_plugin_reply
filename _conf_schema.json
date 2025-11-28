@@ -1,0 +1,37 @@
+{
+  "admin_qq": {
+    "description": "管理员QQ号列表（用逗号分隔），例如：123456789,987654321",
+    "type": "string",
+    "default": ""
+  },
+  "default_enabled": {
+    "description": "新添加的回复是否默认启用",
+    "type": "bool",
+    "default": true
+  },
+  "group_separate": {
+    "description": "是否启用群组独立配置",
+    "type": "bool",
+    "default": true
+  },
+  "max_keywords_per_group": {
+    "description": "每个群组最大关键词数量",
+    "type": "int",
+    "default": 50
+  },
+  "enable_image_reply": {
+    "description": "是否启用图片回复功能",
+    "type": "bool",
+    "default": true
+  },
+  "allow_network_images": {
+    "description": "是否允许使用网络图片",
+    "type": "bool",
+    "default": true
+  },
+  "reply_with_at": {
+    "description": "回复时是否@用户",
+    "type": "bool",
+    "default": true
+  }
+}
